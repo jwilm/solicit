@@ -17,10 +17,11 @@ hpack = "0.3"
 log = "^0.3"
 
 [dependencies.openssl]
-version = "0.6"
-features = ["tlsv1_2", "npn"]
+# >= 0.7.9 is required for SslStream to be Send
+version = "0.7.9"
+features = ["tlsv1_2", "alpn"]
 optional = true
 
 [features]
 live_tests = []
-tls = ["openssl", "openssl/tlsv1_2", "openssl/npn"]
+tls = ["openssl", "openssl/tlsv1_2", "openssl/alpn"]

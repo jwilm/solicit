@@ -638,13 +638,13 @@ impl Client {
     pub fn with_connector<C, S>(connector: C) -> Option<Client>
             where C: HttpConnect<Stream=S>, S: TransportStream + Send + 'static {
         // Use the provided connector to establish a network connection...
-        let client_stream = connector.connect().ok().unwrap();
+        let client_stream = connector.connect().expect("client stream");
         // Keep a socket handle in order to shut it down once the service stops. This is required
         // because if the service decides to stop (due to all clients disconnecting) while the
         // socket is still open and the read thread waiting, it can happen that the read thread
         // (and as such the socket itself) ends up waiting indefinitely (or well, until the server
         // decides to close it), effectively leaking the socket and thread.
-        let mut sck = client_stream.0.try_split().unwrap();
+        let mut sck = client_stream.0.try_split().expect("try split stream");
 
         let service = match ClientService::new(client_stream) {
             Some(service) => service,
@@ -667,17 +667,17 @@ impl Client {
             // This is the one place where it's okay to unwrap, as if the shutdown fails, there's
             // really nothing we can do to recover at this point...
             // This forces the reader thread to stop, as the socket is no longer operational.
-            sck.close().unwrap();
+            sck.close().expect("close socket handler");
         });
         thread::spawn(move || {
             while let Ok(_) = send_frame.send_next() {
-                sender_work_queue.send(WorkItem::SendData).unwrap();
+                sender_work_queue.send(WorkItem::SendData).expect("send data to work queue");
             }
             debug!("Sender thread halting");
         });
         thread::spawn(move || {
             while let Ok(_) = recv_frame.read_next() {
-                read_notify.send(WorkItem::HandleFrame).unwrap();
+                read_notify.send(WorkItem::HandleFrame).expect("send to read notify");
             }
             debug!("Reader thread halting");
         });

@@ -113,7 +113,7 @@ pub enum TlsConnectError {
     /// It wraps the established SSL stream in order to allow the client to
     /// decide what to do with it (and the application protocol that was
     /// chosen).
-    Http2NotSupported(SslStream<TcpStream>),
+    Http2NotSupported,
 }
 
 // Note: TcpStream does not implement `Debug` in 1.0.0, so deriving is not possible.
@@ -123,13 +123,13 @@ impl fmt::Debug for TlsConnectError {
         try!(write!(fmt, "TlsConnectError::{}", match *self {
             TlsConnectError::IoError(_) => "IoError",
             TlsConnectError::SslError(_) => "SslError",
-            TlsConnectError::Http2NotSupported(_) => "Http2NotSupported",
+            TlsConnectError::Http2NotSupported => "Http2NotSupported",
         }));
         // ...and the wrapped value, except for when it's the stream.
         match *self {
             TlsConnectError::IoError(ref err) => try!(write!(fmt, "({:?})", err)),
             TlsConnectError::SslError(ref err) => try!(write!(fmt, "({:?})", err)),
-            TlsConnectError::Http2NotSupported(_) => try!(write!(fmt, "(...)")),
+            TlsConnectError::Http2NotSupported => try!(write!(fmt, "(...)")),
         };
 
         Ok(())
@@ -147,7 +147,7 @@ impl error::Error for TlsConnectError {
         match *self {
             TlsConnectError::IoError(ref err) => err.description(),
             TlsConnectError::SslError(ref err) => err.description(),
-            TlsConnectError::Http2NotSupported(_) => "HTTP/2 not supported by the server",
+            TlsConnectError::Http2NotSupported => "HTTP/2 not supported by the server",
         }
     }
 
@@ -155,7 +155,7 @@ impl error::Error for TlsConnectError {
         match *self {
             TlsConnectError::IoError(ref err) => Some(err),
             TlsConnectError::SslError(ref err) => Some(err),
-            TlsConnectError::Http2NotSupported(_) => None,
+            TlsConnectError::Http2NotSupported => None,
         }
     }
 }
@@ -232,12 +232,16 @@ impl<'a, 'ctx> HttpConnect for TlsConnector<'a, 'ctx> {
         try!(ssl.set_hostname(self.host));
 
         // Wrap the Ssl instance into an `SslStream`
-        let mut ssl_stream = try!(SslStream::new_from(ssl, raw_tcp));
+        let mut ssl_stream = try!(SslStream::connect(ssl, raw_tcp));
         // This connector only understands HTTP/2, so if that wasn't chosen in
         // NPN, we raise an error.
-        let fail = match ssl_stream.get_selected_npn_protocol() {
-            None => true,
+        let fail = match ssl_stream.ssl().selected_alpn_protocol() {
+            None => {
+                println!("selected_npn_protocol is None");
+                true
+            },
             Some(proto) => {
+                println!("selected_npn_protocol is {:?}", str::from_utf8(proto));
                 // Make sure that the protocol is one of the HTTP/2 protocols.
                 debug!("Selected protocol -> {:?}", str::from_utf8(proto));
                 let found = ALPN_PROTOCOLS.iter().any(|&http2_proto| http2_proto == proto);
@@ -250,7 +254,7 @@ impl<'a, 'ctx> HttpConnect for TlsConnector<'a, 'ctx> {
             // We need the fail flag (instead of returning from one of the match
             // arms above because we need to move the `ssl_stream` and that is
             // not possible above (since it's borrowed at that point).
-            return Err(TlsConnectError::Http2NotSupported(ssl_stream));
+            return Err(TlsConnectError::Http2NotSupported);
         }
 
         // Now that the stream is correctly established, we write the client preface.

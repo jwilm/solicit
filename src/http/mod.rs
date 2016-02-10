@@ -1,10 +1,13 @@
 //! The module implements the framing layer of HTTP/2 and exposes an API for using it.
 use std::io;
 use std::fmt;
+use std::str;
 use std::borrow::Cow;
 use std::borrow::Borrow;
 use std::convert::From;
 use std::error::Error;
+use std::fmt::{Debug};
+use std::ops::Deref;
 
 use hpack::decoder::DecoderError;
 
@@ -566,6 +569,18 @@ pub struct Response<'n, 'v> {
     pub headers: Vec<Header<'n, 'v>>,
     /// The full body of the response as an uninterpreted sequence of bytes.
     pub body: Vec<u8>,
+}
+
+impl<'n, 'v> Debug for Response<'n, 'v> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let headers = self.headers.iter().map(|header| {
+            (str::from_utf8(header.name.deref()).unwrap(),
+             str::from_utf8(header.value.deref()).unwrap())
+        }).collect::<Vec<_>>();
+
+        write!(f, "Response {{ stream_id: {}, headers: {:?}, body: {:?} }}",
+               self.stream_id, headers, str::from_utf8(&self.body[..]).unwrap())
+    }
 }
 
 /// A type alias for a `Response` where all headers' names and values must have a `'static`

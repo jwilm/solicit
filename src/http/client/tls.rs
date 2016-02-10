@@ -236,10 +236,10 @@ impl<'a, 'ctx> HttpConnect for TlsConnector<'a, 'ctx> {
         try!(ssl.set_hostname(self.host));
 
         // Wrap the Ssl instance into an `SslStream`
-        let mut ssl_stream = try!(SslStream::new_from(ssl, raw_tcp));
+        let mut ssl_stream = try!(SslStream::connect(ssl, raw_tcp));
         // This connector only understands HTTP/2, so if that wasn't chosen in
         // NPN, we raise an error.
-        let fail = match ssl_stream.get_selected_npn_protocol() {
+        let fail = match ssl_stream.ssl().selected_alpn_protocol() {
             None => true,
             Some(proto) => {
                 // Make sure that the protocol is one of the HTTP/2 protocols.

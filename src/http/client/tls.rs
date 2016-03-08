@@ -237,11 +237,9 @@ impl<'a, 'ctx> HttpConnect for TlsConnector<'a, 'ctx> {
         // NPN, we raise an error.
         let fail = match ssl_stream.ssl().selected_alpn_protocol() {
             None => {
-                println!("selected_npn_protocol is None");
                 true
             },
             Some(proto) => {
-                println!("selected_npn_protocol is {:?}", str::from_utf8(proto));
                 // Make sure that the protocol is one of the HTTP/2 protocols.
                 debug!("Selected protocol -> {:?}", str::from_utf8(proto));
                 let found = ALPN_PROTOCOLS.iter().any(|&http2_proto| http2_proto == proto);

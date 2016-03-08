@@ -9,7 +9,7 @@ use std::str;
 fn main() {
     // Connect to a server that supports HTTP/2
     let connector = CleartextConnector::new("http2bin.org");
-    let client = Client::with_connector(connector).unwrap();
+    let client = Client::with_connector(connector, 5).unwrap();
 
     // Issue 5 requests from 5 different threads concurrently and wait for all
     // threads to receive their response.

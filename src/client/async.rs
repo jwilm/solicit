@@ -322,7 +322,7 @@ impl ClientService {
     ///
     /// If no HTTP/2 connection can be established to the given host on the
     /// given port, returns `None`.
-    pub fn new<S>(client_stream: ClientStream<S>) -> Option<Service<S>>
+    pub fn new<S>(client_stream: ClientStream<S>, in_flight_limit: u32) -> Option<Service<S>>
             where S: TransportStream {
         let (tx, rx): (Sender<WorkItem>, Receiver<WorkItem>) =
                 mpsc::channel();
@@ -343,7 +343,7 @@ impl ClientService {
 
         let service = ClientService {
             outstanding_reqs: 0,
-            limit: 3,
+            limit: in_flight_limit,
             conn: conn,
             chans: HashMap::new(),
             work_queue: rx,
@@ -574,7 +574,7 @@ impl ClientService {
 ///
 /// // Connect to a server that supports HTTP/2
 /// let connector = CleartextConnector::new("http2bin.org");
-/// let client = Client::with_connector(connector).unwrap();
+/// let client = Client::with_connector(connector, 3).unwrap();
 ///
 /// // Issue 5 requests from 5 different threads concurrently and wait for all
 /// // threads to receive their response.
@@ -635,7 +635,7 @@ impl Client {
     /// the thread to exit.
     ///
     /// If the HTTP/2 connection cannot be initialized returns `None`.
-    pub fn with_connector<C, S>(connector: C) -> Option<Client>
+    pub fn with_connector<C, S>(connector: C, in_flight_limit: u32) -> Option<Client>
             where C: HttpConnect<Stream=S>, S: TransportStream + Send + 'static {
         // Use the provided connector to establish a network connection...
         let client_stream = connector.connect().expect("client stream");
@@ -646,7 +646,7 @@ impl Client {
         // decides to close it), effectively leaking the socket and thread.
         let mut sck = client_stream.0.try_split().expect("try split stream");
 
-        let service = match ClientService::new(client_stream) {
+        let service = match ClientService::new(client_stream, in_flight_limit) {
             Some(service) => service,
             None => return None,
         };

@@ -341,7 +341,7 @@ impl ClientService {
     ///
     /// If no HTTP/2 connection can be established to the given host on the
     /// given port, returns `None`.
-    pub fn new<S>(client_stream: ClientStream<S>) -> Service<S>
+    pub fn new<S>(client_stream: ClientStream<S>, in_flight_limit: u32) -> Service<S>
         where S: TransportStream
     {
         let (tx, rx): (Sender<WorkItem>, Receiver<WorkItem>) = mpsc::channel();
@@ -361,7 +361,7 @@ impl ClientService {
 
         let service = ClientService {
             outstanding_reqs: 0,
-            limit: 3,
+            limit: in_flight_limit,
             conn: conn,
             chans: HashMap::new(),
             work_queue: rx,
@@ -606,7 +606,7 @@ impl ClientService {
 ///
 /// // Connect to a server that supports HTTP/2
 /// let connector = CleartextConnector::new("http2bin.org");
-/// let client = Client::with_connector(connector).unwrap();
+/// let client = Client::with_connector(connector, 3).unwrap();
 ///
 /// // Issue 5 requests from 5 different threads concurrently and wait for all
 /// // threads to receive their response.
@@ -665,7 +665,8 @@ impl Client {
     /// the thread to exit.
     ///
     /// If the HTTP/2 connection cannot be initialized returns `None`.
-    pub fn with_connector<C, S, E>(connector: C) -> Result<Client, ClientConnectError<E>>
+    pub fn with_connector<C, S, E>(connector: C,
+                                   in_flight_limit: u32) -> Result<Client, ClientConnectError<E>>
         where C: HttpConnect<Stream = S, Err = E>,
               S: TransportStream + Send + 'static,
               E: HttpConnectError + 'static
@@ -680,7 +681,7 @@ impl Client {
         // decides to close it), effectively leaking the socket and thread.
         let mut sck = try!(client_stream.0.try_split());
 
-        let service = ClientService::new(client_stream);
+        let service = ClientService::new(client_stream, in_flight_limit);
 
         let Service(mut service, rx, mut recv_frame, mut send_frame) = service;
 

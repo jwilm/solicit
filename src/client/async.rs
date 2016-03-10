@@ -289,6 +289,8 @@ struct ClientService {
     host: Vec<u8>,
     /// Whether the connection has already been initialized.
     initialized: bool,
+    /// Callback that's run when a request is completed
+    done_func: Box<Fn() + Send>,
 }
 
 /// A helper wrapper around the components of the `ClientService` that are returned from its
@@ -322,8 +324,12 @@ impl ClientService {
     ///
     /// If no HTTP/2 connection can be established to the given host on the
     /// given port, returns `None`.
-    pub fn new<S>(client_stream: ClientStream<S>, in_flight_limit: u32) -> Option<Service<S>>
-            where S: TransportStream {
+    pub fn new<S, F>(client_stream: ClientStream<S>,
+                     in_flight_limit: u32,
+                     done_func: Box<F>) -> Option<Service<S>>
+        where S: TransportStream,
+              F: Fn() + Send + 'static
+    {
         let (tx, rx): (Sender<WorkItem>, Receiver<WorkItem>) =
                 mpsc::channel();
         let ClientStream(stream, scheme, host) = client_stream;
@@ -353,6 +359,7 @@ impl ClientService {
             client_count: 0,
             host: host.as_bytes().to_vec(),
             initialized: false,
+            done_func: done_func,
         };
 
         // Returns the handles to the channel sender/receiver, so that the client can use them to
@@ -525,6 +532,9 @@ impl ClientService {
                     headers: stream.headers.unwrap(),
                     body: stream.body,
                 });
+
+                let done_func = &self.done_func;
+                done_func();
             }
         };
     }
@@ -574,7 +584,7 @@ impl ClientService {
 ///
 /// // Connect to a server that supports HTTP/2
 /// let connector = CleartextConnector::new("http2bin.org");
-/// let client = Client::with_connector(connector, 3).unwrap();
+/// let client = Client::with_connector(connector, 3, || println!("req done")).unwrap();
 ///
 /// // Issue 5 requests from 5 different threads concurrently and wait for all
 /// // threads to receive their response.
@@ -635,8 +645,13 @@ impl Client {
     /// the thread to exit.
     ///
     /// If the HTTP/2 connection cannot be initialized returns `None`.
-    pub fn with_connector<C, S>(connector: C, in_flight_limit: u32) -> Option<Client>
-            where C: HttpConnect<Stream=S>, S: TransportStream + Send + 'static {
+    pub fn with_connector<C, S, F>(connector: C,
+                                   in_flight_limit: u32,
+                                   done_func: F) -> Option<Client>
+            where C: HttpConnect<Stream=S>,
+                  S: TransportStream + Send + 'static,
+                  F: Fn() + Send + 'static
+    {
         // Use the provided connector to establish a network connection...
         let client_stream = connector.connect().expect("client stream");
         // Keep a socket handle in order to shut it down once the service stops. This is required
@@ -646,7 +661,10 @@ impl Client {
         // decides to close it), effectively leaking the socket and thread.
         let mut sck = client_stream.0.try_split().expect("try split stream");
 
-        let service = match ClientService::new(client_stream, in_flight_limit) {
+        let service = match ClientService::new(client_stream,
+                                               in_flight_limit,
+                                               Box::new(done_func))
+        {
             Some(service) => service,
             None => return None,
         };

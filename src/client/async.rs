@@ -290,7 +290,7 @@ struct ClientService {
     /// Whether the connection has already been initialized.
     initialized: bool,
     /// Callback that's run when a request is completed
-    done_func: Box<Fn() + Send>,
+    done_func: Box<Fn(usize, usize, usize) + Send>,
 }
 
 /// A helper wrapper around the components of the `ClientService` that are returned from its
@@ -328,7 +328,8 @@ impl ClientService {
                      in_flight_limit: u32,
                      done_func: Box<F>) -> Option<Service<S>>
         where S: TransportStream,
-              F: Fn() + Send + 'static
+              // queued, limit, in-flight
+              F: Fn(usize, usize, usize) + Send + 'static
     {
         let (tx, rx): (Sender<WorkItem>, Receiver<WorkItem>) =
                 mpsc::channel();
@@ -534,7 +535,10 @@ impl ClientService {
                 });
 
                 let done_func = &self.done_func;
-                done_func();
+
+                done_func(self.request_queue.len(),
+                          self.limit as usize,
+                          self.outstanding_reqs as usize);
             }
         };
     }
@@ -584,7 +588,7 @@ impl ClientService {
 ///
 /// // Connect to a server that supports HTTP/2
 /// let connector = CleartextConnector::new("http2bin.org");
-/// let client = Client::with_connector(connector, 3, || println!("req done")).unwrap();
+/// let client = Client::with_connector(connector, 3, |_, _, _| println!("req done")).unwrap();
 ///
 /// // Issue 5 requests from 5 different threads concurrently and wait for all
 /// // threads to receive their response.
@@ -650,7 +654,7 @@ impl Client {
                                    done_func: F) -> Option<Client>
             where C: HttpConnect<Stream=S>,
                   S: TransportStream + Send + 'static,
-                  F: Fn() + Send + 'static
+                  F: Fn(usize, usize, usize) + Send + 'static
     {
         // Use the provided connector to establish a network connection...
         let client_stream = connector.connect().expect("client stream");

@@ -9,7 +9,7 @@ use std::str;
 fn main() {
     // Connect to a server that supports HTTP/2
     let connector = CleartextConnector::new("http2bin.org");
-    let client = Client::with_connector(connector, 5, move || {
+    let client = Client::with_connector(connector, 5, move |_queued, _limit, _pending| {
         println!("A request completed");
     }).unwrap();
 

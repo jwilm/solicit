@@ -683,26 +683,26 @@ impl Client {
         let read_notify = rx.clone();
         let sender_work_queue = rx.clone();
 
-        thread::spawn(move || {
+        thread::Builder::new().name("Solicit Service".into()).spawn(move || {
             while let Ok(_) = service.run_once() {}
             debug!("Service thread halting");
             // This is the one place where it's okay to unwrap, as if the shutdown fails, there's
             // really nothing we can do to recover at this point...
             // This forces the reader thread to stop, as the socket is no longer operational.
             sck.close().expect("close socket handler");
-        });
-        thread::spawn(move || {
+        }).expect("spawn thread");
+        thread::Builder::new().name("Solicit Sender".into()).spawn(move || {
             while let Ok(_) = send_frame.send_next() {
                 sender_work_queue.send(WorkItem::SendData).expect("send data to work queue");
             }
             debug!("Sender thread halting");
-        });
-        thread::spawn(move || {
+        }).expect("spawn thread");
+        thread::Builder::new().name("Solicit Reader".into()).spawn(move || {
             while let Ok(_) = recv_frame.read_next() {
                 read_notify.send(WorkItem::HandleFrame).expect("send to read notify");
             }
             debug!("Reader thread halting");
-        });
+        }).expect("spawn thread");
 
         Some(Client {
             sender: rx,

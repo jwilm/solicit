@@ -8,7 +8,7 @@ use http::{
     HttpScheme,
     ErrorCode,
 };
-use http::frame::{HttpSetting};
+use http::frame::{HttpSetting, PingFrame};
 use http::connection::{
     SendFrame, ReceiveFrame,
     HttpConnection, EndStream,
@@ -121,6 +121,16 @@ impl<'a, State, F, S> Session for ServerSession<'a, State, F, S>
             -> HttpResult<()> {
         debug!("RST_STREAM id={:?}, error={:?}", stream_id, error_code);
         self.state.get_stream_mut(stream_id).map(|stream| stream.on_rst_stream(error_code));
+        Ok(())
+    }
+
+    fn on_ping(&mut self, ping: &PingFrame, conn: &mut HttpConnection) -> HttpResult<()> {
+        debug!("Sending a PING ack");
+        conn.sender(self.sender).send_ping_ack(ping.opaque_data())
+    }
+
+    fn on_pong(&mut self, _ping: &PingFrame, _conn: &mut HttpConnection) -> HttpResult<()> {
+        debug!("Received a PING ack");
         Ok(())
     }
 

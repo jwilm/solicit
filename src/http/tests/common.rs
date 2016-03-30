@@ -14,7 +14,7 @@ use http::{
     OwnedHeader,
     ErrorCode,
 };
-use http::frame::{RawFrame, FrameIR, FrameHeader, pack_header, HttpSetting};
+use http::frame::{RawFrame, FrameIR, FrameHeader, pack_header, HttpSetting, PingFrame};
 use http::session::{
     Session,
     DefaultSessionState,
@@ -189,6 +189,7 @@ pub fn build_stub_from_frames(frames: &Vec<HttpFrame>) -> Vec<u8> {
             HttpFrame::HeadersFrame(ref frame) => serialize_frame(frame),
             HttpFrame::RstStreamFrame(ref frame) => serialize_frame(frame),
             HttpFrame::SettingsFrame(ref frame) => serialize_frame(frame),
+            HttpFrame::PingFrame(ref frame) => serialize_frame(frame),
             HttpFrame::GoawayFrame(ref frame) => serialize_frame(frame),
             HttpFrame::WindowUpdateFrame(ref frame) => serialize_frame(frame),
             HttpFrame::UnknownFrame(ref frame) => serialize_frame(frame),
@@ -339,6 +340,14 @@ impl Session for TestSession {
 
     fn new_settings(&mut self, _settings: Vec<HttpSetting>, _conn: &mut HttpConnection)
             -> HttpResult<()> {
+        Ok(())
+    }
+
+    fn on_ping(&mut self, _ping: &PingFrame, _conn: &mut HttpConnection) -> HttpResult<()> {
+        Ok(())
+    }
+
+    fn on_pong(&mut self, _ping: &PingFrame, _conn: &mut HttpConnection) -> HttpResult<()> {
         Ok(())
     }
 

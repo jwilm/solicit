@@ -8,7 +8,7 @@ use std::error;
 
 use http::{HttpScheme, HttpResult, StreamId, Header, HttpError, ErrorCode};
 use http::transport::TransportStream;
-use http::frame::{SettingsFrame, HttpSetting, FrameIR};
+use http::frame::{SettingsFrame, PingFrame, HttpSetting, FrameIR};
 use http::connection::{
     SendFrame, ReceiveFrame,
     SendStatus,
@@ -238,6 +238,12 @@ impl<State> ClientConnection<State>
         Ok(stream_id)
     }
 
+    /// Send a PING
+    pub fn send_ping<S: SendFrame>(&mut self, sender: &mut S) -> HttpResult<()> {
+        try!(self.conn.sender(sender).send_ping(0));
+        Ok(())
+    }
+
     /// Fully handles the next incoming frame provided by the given `ReceiveFrame` instance.
     /// Handling a frame may cause changes to the session state exposed by the `ClientConnection`.
     pub fn handle_next_frame<Recv: ReceiveFrame, Sender: SendFrame>(
@@ -363,6 +369,16 @@ impl<'a, State, S> Session for ClientSession<'a, State, S>
             -> HttpResult<()> {
         debug!("Sending a SETTINGS ack");
         conn.sender(self.sender).send_settings_ack()
+    }
+
+    fn on_ping(&mut self, ping: &PingFrame, conn: &mut HttpConnection) -> HttpResult<()> {
+        debug!("Sending a PING ack");
+        conn.sender(self.sender).send_ping_ack(ping.opaque_data())
+    }
+
+    fn on_pong(&mut self, _ping: &PingFrame, _conn: &mut HttpConnection) -> HttpResult<()> {
+        debug!("Received a PING ack");
+        Ok(())
     }
 }
 

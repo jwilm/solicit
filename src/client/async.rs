@@ -5,10 +5,10 @@
 //! asynchronously.
 use std::collections::HashMap;
 
+use std::io;
 use std::sync::mpsc::{Sender, Receiver};
 use std::sync::mpsc;
 use std::thread;
-use std::io;
 
 use http::{StreamId, HttpError, Response, StaticResponse, Header, HttpResult, StaticHeader};
 use http::frame::{RawFrame, FrameIR};
@@ -25,7 +25,7 @@ use http::client::{ClientConnection, HttpConnect, ClientStream, RequestStream};
 
 /// A struct representing an asynchronously dispatched request. It is used
 /// internally be the `ClientService` and `Client` structs.
-struct AsyncRequest {
+struct AsyncRequest<T> {
     /// The method of the request
     pub method: Vec<u8>,
     /// The path being requested
@@ -37,7 +37,7 @@ struct AsyncRequest {
     pub body: Option<Vec<u8>>,
     /// The sender side of a channel where the response to this request should
     /// be delivered.
-    tx: Sender<StaticResponse>,
+    user_data: T,
 }
 
 /// A struct that buffers `RawFrame`s in an internal `mpsc` channel and sends them using the
@@ -214,9 +214,9 @@ impl From<HttpError> for ClientServiceErr {
 
 /// An enum representing the types of work that the `ClientService` can perform from within its
 /// `run_once` method.
-enum WorkItem {
+enum WorkItem<T> {
     /// Queue a new request to the HTTP/2 connection.
-    Request(AsyncRequest),
+    Request(AsyncRequest<T>),
     /// Trigger a new `handle_next_frame`. The work item should be queued only when there is a
     /// frame to be handled to avoid blocking the `run_once` call.
     HandleFrame,
@@ -262,7 +262,7 @@ enum WorkItem {
 ///       of a real event loop, which is slightly out of scope of the `solicit` library, as
 ///       imagined; the async client is (for now) supposed to be a proof-of-concept
 ///       implementation of a high-level async/concurrent HTTP/2 client.
-struct ClientService {
+struct ClientService<T> {
     /// The number of requests that have been sent, but are yet unanswered.
     outstanding_reqs: u32,
     /// The limit to the number of requests that can be pending (unanswered,
@@ -276,14 +276,13 @@ struct ClientService {
     /// The handle allows the service to queue HTTP/2 frames for another thread to push out on a
     /// blocking socket.
     send_handle: ChannelFrameSenderHandle,
-    /// A mapping of stream IDs to the sender side of a channel that is
-    /// expecting a response to the request that is to arrive on that stream.
-    chans: HashMap<StreamId, Sender<StaticResponse>>,
+    /// A mapping of stream IDs to user data associated with a request
+    user_data: HashMap<StreamId, T>,
     /// The receiver end of a channel to which work items for the service are
     /// queued. Work items include the variants of the `WorkItem` enum.
-    work_queue: Receiver<WorkItem>,
+    work_queue: Receiver<WorkItem<T>>,
     /// The queue of `AsyncRequest`s that haven't yet been sent to the server.
-    request_queue: Vec<AsyncRequest>,
+    request_queue: Vec<AsyncRequest<T>>,
     /// Tracks the number of currently connected clients -- once it reaches 0, the `run_once`
     /// method returns an error.
     client_count: i32,
@@ -292,18 +291,18 @@ struct ClientService {
     /// Whether the connection has already been initialized.
     initialized: bool,
     /// Callback that's run when a request is completed
-    done_func: Box<Fn(usize, usize, usize) + Send>,
+    done_func: Box<Fn(StaticResponse, T, usize, usize, usize) + Send>,
 }
 
 /// A helper wrapper around the components of the `ClientService` that are returned from its
 /// constructor.
-struct Service<S>(
-    ClientService,
-    Sender<WorkItem>,
+struct Service<S, T>(
+    ClientService<T>,
+    Sender<WorkItem<T>>,
     ChannelFrameReceiver<S>,
     ChannelFrameSender<S>) where S: TransportStream;
 
-impl ClientService {
+impl<T> ClientService<T> {
     /// Creates a new `ClientService` that will use the provided `ClientStream` for its underlying
     /// network communication. A handle is returned for both the read, as well as the write end of
     /// the socket that allows the client that creates the `ClientService` to perform the blocking
@@ -328,12 +327,12 @@ impl ClientService {
     /// given port, returns `None`.
     pub fn new<S, F>(client_stream: ClientStream<S>,
                      in_flight_limit: u32,
-                     done_func: Box<F>) -> Option<Service<S>>
+                     done_func: Box<F>) -> Option<Service<S, T>>
         where S: TransportStream,
               // queued, limit, in-flight
-              F: Fn(usize, usize, usize) + Send + 'static
+              F: Fn(StaticResponse, T, usize, usize, usize) + Send + 'static
     {
-        let (tx, rx): (Sender<WorkItem>, Receiver<WorkItem>) =
+        let (tx, rx): (Sender<WorkItem<T>>, Receiver<WorkItem<T>>) =
                 mpsc::channel();
         let ClientStream(stream, scheme, host) = client_stream;
 
@@ -354,7 +353,7 @@ impl ClientService {
             outstanding_reqs: 0,
             limit: in_flight_limit,
             conn: conn,
-            chans: HashMap::new(),
+            user_data: HashMap::new(),
             work_queue: rx,
             recv_handle: recv_handle,
             send_handle: send_handle,
@@ -475,8 +474,8 @@ impl ClientService {
     /// Internal helper method. Sends a request to the server based on the
     /// parameters given in the `AsyncRequest`. It blocks until the request is
     /// fully transmitted to the server.
-    fn send_request(&mut self, async_req: AsyncRequest) {
-        let (req, tx) = self.create_request(async_req);
+    fn send_request(&mut self, async_req: AsyncRequest<T>) {
+        let (req, user) = self.create_request(async_req);
 
         trace!("Sending new request...");
 
@@ -486,7 +485,7 @@ impl ClientService {
         //               then be called by the session (i.e. the `ClientConnection` in this case).
         self.conn.state.get_stream_mut(stream_id).unwrap().stream_id = Some(stream_id);
 
-        self.chans.insert(stream_id, tx);
+        self.user_data.insert(stream_id, user);
         self.outstanding_reqs += 1;
     }
 
@@ -495,8 +494,8 @@ impl ClientService {
     /// the connection for transmission to the server (i.e. `start_request`).
     /// Also returns the sender end of the channel to which the response is to be transmitted,
     /// once received.
-    fn create_request(&self, async_req: AsyncRequest)
-            -> (RequestStream<'static, 'static, DefaultStream>, Sender<StaticResponse>) {
+    fn create_request(&self, async_req: AsyncRequest<T>)
+            -> (RequestStream<'static, 'static, DefaultStream>, T) {
         let mut headers: Vec<Header> = Vec::new();
         headers.extend(vec![
             Header::new(b":method", async_req.method),
@@ -517,7 +516,7 @@ impl ClientService {
                 stream: stream,
                 headers: headers,
             },
-            async_req.tx
+            async_req.user_data
         )
     }
 
@@ -527,22 +526,24 @@ impl ClientService {
     /// The given `stream` instance is consumed by this method.
     fn send_response(&mut self, stream: DefaultStream) {
         let stream_id = stream.stream_id.unwrap();
-        match self.chans.remove(&stream_id) {
+        match self.user_data.remove(&stream_id) {
             None => {
                 // This should never happen, it means the session gave us
                 // a response that we didn't request.
-                panic!("Received a response for an unknown request!");
+                error!("Received a response for an unknown request!");
             },
-            Some(tx) => {
-                let _ = tx.send(Response {
+            Some(val) => {
+                let response = Response {
                     stream_id: stream_id,
                     headers: stream.headers.unwrap(),
                     body: stream.body,
-                });
+                };
 
                 let done_func = &self.done_func;
 
-                done_func(self.request_queue.len(),
+                done_func(response,
+                          val,
+                          self.request_queue.len(),
                           self.limit as usize,
                           self.outstanding_reqs as usize);
             }
@@ -620,14 +621,14 @@ impl ClientService {
 ///
 /// let _: Vec<_> = threads.into_iter().map(|thread| thread.join()).collect();
 /// ```
-pub struct Client {
+pub struct Client<T> {
     /// The sender side of a channel on which a running `ClientService` expects
     /// to receive new requests, which are to be sent to the server.
-    sender: Sender<WorkItem>,
+    sender: Sender<WorkItem<T>>,
 }
 
-impl Clone for Client {
-    fn clone(&self) -> Client {
+impl<T> Clone for Client<T> {
+    fn clone(&self) -> Client<T> {
         self.sender.send(WorkItem::NewClient).unwrap();
         Client {
             sender: self.sender.clone(),
@@ -635,13 +636,13 @@ impl Clone for Client {
     }
 }
 
-impl Drop for Client {
+impl<T> Drop for Client<T> {
     fn drop(&mut self) {
         let _ = self.sender.send(WorkItem::ClientLeft);
     }
 }
 
-impl Client {
+impl<T> Client<T> {
     /// Creates a brand new HTTP/2 client. This means that a new HTTP/2
     /// connection will be established behind the scenes. A thread is spawned
     /// to handle the connection in the background, so that the thread that
@@ -662,10 +663,11 @@ impl Client {
     /// If the HTTP/2 connection cannot be initialized returns `None`.
     pub fn with_connector<C, S, F>(connector: C,
                                    in_flight_limit: u32,
-                                   done_func: F) -> Option<Client>
+                                   done_func: F) -> Option<Client<T>>
             where C: HttpConnect<Stream=S>,
                   S: TransportStream + Send + 'static,
-                  F: Fn(usize, usize, usize) + Send + 'static
+                  F: Fn(StaticResponse, T, usize, usize, usize) + Send + 'static,
+                  T: Send + 'static
     {
         // Use the provided connector to establish a network connection...
         let client_stream = connector.connect().expect("client stream");
@@ -745,10 +747,10 @@ impl Client {
             method: &[u8],
             path: &[u8],
             headers: &[StaticHeader],
-            body: Option<Vec<u8>>)
-            -> Option<Receiver<StaticResponse>> {
-        let (resp_tx, resp_rx): (Sender<StaticResponse>, Receiver<StaticResponse>) =
-                mpsc::channel();
+            body: Option<Vec<u8>>,
+            user_data: T)
+            -> Result<(), T> {
+
         // A send can only fail if the receiver is disconnected. If the send
         // fails here, it means that the service hit an error on the underlying
         // HTTP/2 connection and will never come alive again.
@@ -757,12 +759,19 @@ impl Client {
             path: path.to_vec(),
             headers: headers.to_vec(),
             body: body,
-            tx: resp_tx,
+            user_data: user_data,
         }));
 
         match res {
-            Ok(_) => Some(resp_rx),
-            Err(_) => None,
+            Ok(_) => Ok(()),
+            Err(mpsc::SendError(work)) => {
+                match work {
+                    WorkItem::Request(async) => {
+                        Err(async.user_data)
+                    },
+                    _ => unreachable!()
+                }
+            }
         }
     }
 
@@ -770,16 +779,16 @@ impl Client {
     ///
     /// A convenience wrapper around the `request` method that sets the correct
     /// method.
-    pub fn get(&self, path: &[u8], headers: &[StaticHeader]) -> Option<Receiver<StaticResponse>> {
-        self.request(b"GET", path, headers, None)
+    pub fn get(&self, path: &[u8], headers: &[StaticHeader], user: T) -> Result<(), T> {
+        self.request(b"GET", path, headers, None, user)
     }
 
     /// Issues a POST request to the server.
     ///
     /// Returns the receiving end of a channel where the `Response` will eventually be pushed.
-    pub fn post(&self, path: &[u8], headers: &[StaticHeader], body: Vec<u8>)
-            -> Option<Receiver<StaticResponse>> {
-        self.request(b"POST", path, headers, Some(body))
+    pub fn post(&self, path: &[u8], headers: &[StaticHeader], body: Vec<u8>, user: T)
+            -> Result<(), T> {
+        self.request(b"POST", path, headers, Some(body), user)
     }
 
     /// Sends a PING to the server

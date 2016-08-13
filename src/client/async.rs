@@ -218,6 +218,7 @@ impl ReceiveFrame for ChannelFrameReceiverHandle {
 
 /// An enum that represents errors that can be raised by the operation of a
 /// `ClientService`.
+#[derive(Debug)]
 enum ClientServiceErr {
     /// Corresponds to the case where the service has finished its operation.
     Done,
@@ -231,6 +232,32 @@ impl From<HttpError> for ClientServiceErr {
         ClientServiceErr::Http(err)
     }
 }
+
+impl ::std::error::Error for ClientServiceErr {
+    fn cause(&self) -> Option<&::std::error::Error> {
+        match *self {
+            ClientServiceErr::Done => None,
+            ClientServiceErr::Http(ref err) => Some(err),
+        }
+    }
+
+    fn description(&self) -> &str {
+        match *self {
+            ClientServiceErr::Done => "client finished",
+            ClientServiceErr::Http(ref err) => err.description(),
+        }
+    }
+}
+
+impl ::std::fmt::Display for ClientServiceErr {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        match *self {
+            ClientServiceErr::Done => write!(f, "The client finished normal operation"),
+            ClientServiceErr::Http(ref err) => write!(f, "Client HTTP error: {}", err),
+        }
+    }
+}
+
 
 /// An enum representing the types of work that the `ClientService` can perform from within its
 /// `run_once` method.
@@ -721,7 +748,16 @@ impl<T> Client<T> {
         let sender_work_queue = rx.clone();
 
         spawn_named("Solicit Service", move || {
-            while let Ok(_) = service.run_once() {}
+            loop {
+                match service.run_once() {
+                    Ok(_) => (),
+                    Err(err) => {
+                        error!("Solicit Service received error\n{:?}", err);
+                        break;
+                    }
+                }
+            }
+
             debug!("Service thread halting");
             // This is the one place where it's okay to unwrap, as if the shutdown fails, there's
             // really nothing we can do to recover at this point...

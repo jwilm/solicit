@@ -52,7 +52,7 @@ mod root_tests {
 
     #[test]
     fn test_connection_error_raw_debug_data() {
-        let err = ConnectionError::with_debug_data(ErrorCode::ProtocolError, vec![0x80]);
+        let err = ConnectionError::with_debug_data(ErrorCode::ProtocolError, Some(vec![0x80]));
         assert_eq!(err.error_code(), ErrorCode::ProtocolError);
         assert_eq!(err.debug_data().unwrap(), &[0x80][..]);
         assert!(err.debug_str().is_none());
@@ -61,7 +61,8 @@ mod root_tests {
 
     #[test]
     fn test_connection_error_str_debug_data() {
-        let err = ConnectionError::with_debug_data(ErrorCode::ProtocolError, b"Test".to_vec());
+        let err = ConnectionError::with_debug_data(ErrorCode::ProtocolError,
+                                                   Some(b"Test".to_vec()));
         assert_eq!(err.error_code(), ErrorCode::ProtocolError);
         assert_eq!(err.debug_data().unwrap(), b"Test");
         assert_eq!(err.debug_str().unwrap(), "Test");

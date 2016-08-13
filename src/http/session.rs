@@ -72,12 +72,13 @@ pub trait Session {
                  error_code: ErrorCode,
                  debug_data: Option<&[u8]>,
                  _conn: &mut HttpConnection)
-                 -> HttpResult<()> {
-        Err(HttpError::PeerConnectionError(ConnectionError {
-            error_code: error_code,
-            debug_data: debug_data.map(|data| data.to_vec()),
-        }))
-    }
+                 -> HttpResult<()>
+    {
+        let err = ConnectionError::with_debug_data(error_code,
+                                                   debug_data.map(|data| data.to_vec()));
+
+        Err(HttpError::PeerConnectionError(err))
+   }
 }
 
 /// A newtype for an iterator over `Stream`s saved in a `SessionState`.

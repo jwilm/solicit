@@ -303,11 +303,29 @@ impl Into<u32> for ErrorCode {
     }
 }
 
+/// Debug data associated with a connection error
+#[derive(Debug, Clone, PartialEq)]
+pub enum DebugData {
+    /// Raw bytes (not valid utf8)
+    Raw(Vec<u8>),
+    /// Debug message
+    Utf8(String)
+}
+
+impl fmt::Display for DebugData {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            DebugData::Raw(ref raw) => write!(f, "{:?}", raw),
+            DebugData::Utf8(ref s) => write!(f, "{}", s),
+        }
+    }
+}
+
 /// The struct represents a connection error arising on an HTTP/2 connection.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ConnectionError {
     error_code: ErrorCode,
-    debug_data: Option<Vec<u8>>,
+    debug_data: Option<DebugData>,
 }
 
 impl ConnectionError {
@@ -318,11 +336,19 @@ impl ConnectionError {
             debug_data: None,
         }
     }
+
     /// Creates a new `ConnectionError` with the given associated debug data.
-    pub fn with_debug_data(error_code: ErrorCode, debug_data: Vec<u8>) -> ConnectionError {
+    pub fn with_debug_data(error_code: ErrorCode, debug_data: Option<Vec<u8>>) -> ConnectionError {
+        // Convert raw data to `DebugData` and attempt to parse as Utf8.
+        let debug_data = debug_data.map(|data| {
+            String::from_utf8(data)
+                .map(|s| DebugData::Utf8(s))
+                .unwrap_or_else(|e| DebugData::Raw(e.into_bytes()))
+        });
+
         ConnectionError {
             error_code: error_code,
-            debug_data: Some(debug_data),
+            debug_data: debug_data,
         }
     }
 
@@ -330,13 +356,22 @@ impl ConnectionError {
     pub fn error_code(&self) -> ErrorCode {
         self.error_code
     }
+
     /// The debug data attached to the connection error, if any.
     pub fn debug_data(&self) -> Option<&[u8]> {
-        self.debug_data.as_ref().map(|d| d.as_ref())
+        match self.debug_data {
+            Some(DebugData::Raw(ref vec)) => Some(vec.as_slice()),
+            Some(DebugData::Utf8(ref s)) => Some(s.as_bytes()),
+            None => None,
+        }
     }
+
     /// The debug data interpreted as a string, if possible.
     pub fn debug_str(&self) -> Option<&str> {
-        self.debug_data().and_then(|data| ::std::str::from_utf8(data).ok())
+        match self.debug_data {
+            Some(DebugData::Raw(_)) | None => None,
+            Some(DebugData::Utf8(ref s)) => Some(s.as_str())
+        }
     }
 }
 

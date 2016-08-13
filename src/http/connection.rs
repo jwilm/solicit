@@ -370,7 +370,7 @@ impl HttpConnection {
     pub fn expect_settings<Recv: ReceiveFrame, Sess: Session>(&mut self,
                                                               rx: &mut Recv,
                                                               session: &mut Sess)
-                                                              -> HttpResult<()> {
+                                                              -> HttpResult<SettingsFrame> {
         let frame = rx.recv_frame();
         match frame {
             Ok(HttpFrame::SettingsFrame(settings)) => {
@@ -378,8 +378,8 @@ impl HttpConnection {
                     Err(HttpError::UnableToConnect)
                 } else {
                     debug!("Correctly received a SETTINGS frame from the server");
-                    try!(self.handle_frame(HttpFrame::SettingsFrame(settings), session));
-                    Ok(())
+                    try!(self.handle_frame(HttpFrame::SettingsFrame(settings.clone()), session));
+                    Ok(settings)
                 }
             }
             // Wrong frame received...

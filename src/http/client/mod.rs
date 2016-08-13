@@ -229,7 +229,7 @@ impl<State> ClientConnection<State>
     pub fn expect_settings<Recv: ReceiveFrame, Sender: SendFrame>(&mut self,
                                                                   rx: &mut Recv,
                                                                   tx: &mut Sender)
-                                                                  -> HttpResult<()> {
+                                                                  -> HttpResult<SettingsFrame> {
         let mut session = ClientSession::new(&mut self.state, tx);
         self.conn.expect_settings(rx, &mut session)
     }

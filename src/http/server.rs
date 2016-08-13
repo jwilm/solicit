@@ -2,7 +2,7 @@
 //! HTTP/2 connection.
 
 use http::{StreamId, Header, HttpResult, HttpScheme, ErrorCode};
-use http::frame::{HttpSetting, PingFrame};
+use http::frame::{HttpSetting, PingFrame, SettingsFrame};
 use http::connection::{SendFrame, ReceiveFrame, HttpConnection, EndStream, SendStatus};
 use http::session::{Session, SessionState, Stream, DefaultStream, DefaultSessionState};
 use http::session::Server as ServerMarker;
@@ -186,7 +186,7 @@ impl<F, State> ServerConnection<F, State>
     pub fn expect_settings<Recv: ReceiveFrame, Sender: SendFrame>(&mut self,
                                                                   rx: &mut Recv,
                                                                   tx: &mut Sender)
-                                                                  -> HttpResult<()> {
+                                                                  -> HttpResult<SettingsFrame> {
         let mut session = ServerSession::new(&mut self.state, &mut self.factory, tx);
         self.conn.expect_settings(rx, &mut session)
     }

@@ -6,6 +6,7 @@ use http::connection::{HttpConnection, SendStatus};
 use http::session::{SessionState, DefaultSessionState, DefaultStream, Stream};
 use http::session::Client as ClientMarker;
 use http::client::{ClientConnection, HttpConnect, RequestStream, ClientStream};
+use http::frame::SettingsFrame;
 
 /// A struct implementing a simple HTTP/2 client.
 ///
@@ -148,7 +149,7 @@ impl<S> SimpleClient<S>
     /// Internal helper method that performs the initialization of the client's
     /// connection.
     #[inline]
-    fn init(&mut self) -> HttpResult<()> {
+    fn init(&mut self) -> HttpResult<SettingsFrame> {
         self.conn.expect_settings(&mut TransportReceiveFrame::new(&mut self.receiver),
                                   &mut self.sender)
     }

@@ -13,6 +13,7 @@ use std::thread;
 
 use http::{StreamId, HttpError, Response, StaticResponse, Header, HttpResult, StaticHeader};
 use http::frame::{RawFrame, FrameIR};
+use http::frame::HttpSetting;
 use http::transport::TransportStream;
 use http::connection::{SendFrame, ReceiveFrame, HttpFrame, HttpConnection};
 use http::session::{SessionState, DefaultSessionState, DefaultStream, Stream};
@@ -465,7 +466,15 @@ impl<T> ClientService<T> {
                 if self.initialized {
                     self.handle_frame()
                 } else {
-                    try!(self.conn.expect_settings(&mut self.recv_handle, &mut self.send_handle));
+                    let settings_frame = try!(self.conn.expect_settings(&mut self.recv_handle,
+                                                                        &mut self.send_handle));
+
+                    for setting in &settings_frame.settings {
+                        if let &HttpSetting::MaxConcurrentStreams(max_streams) = setting {
+                            self.limit = max_streams;
+                        }
+                    }
+
                     self.initialized = true;
                     Ok(())
                 }

@@ -618,27 +618,37 @@ impl<T> ClientService<T> {
 /// use solicit::http::client::CleartextConnector;
 /// use std::thread;
 /// use std::str;
+/// use std::sync::mpsc;
+///
+/// let (tx, rx) = mpsc::channel();
 ///
 /// // Connect to a server that supports HTTP/2
 /// let connector = CleartextConnector::new("http2bin.org");
-/// let client = Client::with_connector(connector, 3, |_, _, _| println!("req done")).unwrap();
+/// let client = Client::with_connector(connector, 3, move |res, _, _, _, _| {
+///     println!("req done");
+///     let _ = tx.send(res);
+/// }).unwrap();
 ///
 /// // Issue 5 requests from 5 different threads concurrently and wait for all
 /// // threads to receive their response.
 /// let threads: Vec<_> = (0..5).map(|i| {
 ///     let this = client.clone();
 ///     thread::spawn(move || {
-///         let resp = this.get(b"/", &[]).unwrap();
-///         let response = resp.recv().unwrap();
-///         println!("Thread {} got response ... {}", i, response.status_code().ok().unwrap());
-///         println!("The response contains the following headers:");
-///         for header in response.headers.iter() {
-///             println!("  {}: {}",
-///                   str::from_utf8(header.name()).unwrap(),
-///                   str::from_utf8(header.value()).unwrap());
-///         }
+///         this.get(b"/", &[], ()).unwrap();
 ///     })
 /// }).collect();
+///
+/// // Receive responses as they arrive (order is not maintained)
+/// for i in 0..5 {
+///     let response = rx.recv().unwrap();
+///     println!("Thread {} got response ... {}", i, response.status_code().ok().unwrap());
+///     println!("The response contains the following headers:");
+///     for header in response.headers.iter() {
+///         println!("  {}: {}",
+///               str::from_utf8(header.name()).unwrap(),
+///               str::from_utf8(header.value()).unwrap());
+///     }
+/// }
 ///
 /// let _: Vec<_> = threads.into_iter().map(|thread| thread.join()).collect();
 /// ```

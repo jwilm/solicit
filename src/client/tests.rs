@@ -57,6 +57,7 @@ mod simple {
 mod async {
     use std::str;
     use std::thread;
+    use std::sync::mpsc;
 
     use http::Response;
     use http::client::CleartextConnector;
@@ -67,18 +68,40 @@ mod async {
     ///
     /// The requests are all issued concurrently (spawning as many threads as there are requests).
     fn get(host: &str, paths: &[String]) -> Vec<Response<'static, 'static>> {
-        let client = Client::with_connector(CleartextConnector::new(host)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let client = Client::with_connector(CleartextConnector::new(host),
+                                            100,
+                                            move |res, i, _, _, _| {
+                                                tx.send((i, res)).unwrap();
+                                            }).unwrap();
         let threads: Vec<_> = paths.iter()
-                                   .map(|path| {
+                                   .enumerate()
+                                   .map(|(i, path)| {
                                        let this = client.clone();
                                        let path = path.clone();
                                        thread::spawn(move || {
-                                           this.get(path.as_bytes(), &[]).unwrap().recv().unwrap()
+                                           this.get(path.as_bytes(), &[], i)
+                                               .unwrap();
                                        })
                                    })
                                    .collect();
 
-        threads.into_iter().map(|t| t.join().unwrap()).collect()
+        // collect results in whatever order they arrive; Vec<usize, Response>
+        let mut results: Vec<(usize, Response<'static, 'static>)> = threads
+            .into_iter()
+            .map(|thread| {
+                thread.join().unwrap();
+                rx.recv().unwrap()
+            })
+            .collect();
+
+        // Sort by request number
+        results.sort_by_key(|val| val.0);
+
+        // Make into Vec<Response>
+        results.into_iter()
+               .map(|(index, res)| res)
+               .collect()
     }
 
     #[test]
@@ -97,10 +120,13 @@ mod async {
     #[test]
     fn test_live_post() {
         let host = "http2bin.org";
-        let client = Client::with_connector(CleartextConnector::new(host)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let client = Client::with_connector(CleartextConnector::new(host),
+                                            100,
+                                            move |res, _, _, _, _| tx.send(res).unwrap()).unwrap();
 
-        let res = client.post(b"/post", &[], b"Hello, World!".to_vec()).unwrap();
-        let res = res.recv().unwrap();
+        client.post(b"/post", &[], b"Hello, World!".to_vec(), ()).unwrap();
+        let res = rx.recv().unwrap();
 
         let body = str::from_utf8(&res.body).unwrap();
         assert!(body.contains("Hello, World!"));
@@ -111,7 +137,7 @@ mod async {
     #[test]
     fn test_error_on_connect_failure2() {
         let connector = CleartextConnector::new("unknown.host.name.lcl");
-        let client = Client::with_connector(connector);
+        let client = Client::with_connector(connector, 100, |_, _t: (), _, _, _| {});
 
         assert!(client.is_err());
     }

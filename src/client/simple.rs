@@ -121,7 +121,7 @@ impl<S> SimpleClient<S>
         let receiver = try!(stream.try_split());
         let conn = HttpConnection::new(scheme);
         let mut client = SimpleClient {
-            conn: ClientConnection::with_connection(conn, state),
+            conn: ClientConnection::with_connection(conn, state, Default::default()),
             host: host.as_bytes().to_vec(),
             receiver: receiver,
             sender: stream,

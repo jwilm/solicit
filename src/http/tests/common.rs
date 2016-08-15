@@ -16,6 +16,7 @@ use http::transport::TransportStream;
 use http::connection::{SendFrame, ReceiveFrame, HttpFrame, HttpConnection, EndStream, DataChunk};
 use http::client::ClientConnection;
 use http::server::StreamFactory;
+use http::settings::SettingsState;
 
 /// Creates a new `RawFrame` from two separate parts: the header and the payload.
 /// Useful for tests that need to create frames, since they can easily specify the header and the
@@ -458,11 +459,13 @@ impl DataPrioritizer for StubDataPrioritizer {
 }
 
 /// A type alias for a `ClientConnection` with mock replacements for its dependent types.
-pub type MockClientConnection = ClientConnection<DefaultSessionState<ClientMarker, TestStream>>;
+pub type MockClientConnection = ClientConnection<SettingsState,
+                                                 DefaultSessionState<ClientMarker, TestStream>>;
 
 /// Returns a `ClientConnection` suitable for use in tests.
 #[inline]
 pub fn build_mock_client_conn() -> MockClientConnection {
     ClientConnection::with_connection(build_mock_http_conn(),
-                                      DefaultSessionState::<ClientMarker, TestStream>::new())
+                                      DefaultSessionState::<ClientMarker, TestStream>::new(),
+                                      Default::default())
 }

@@ -13,12 +13,12 @@ use std::thread;
 
 use http::{StreamId, HttpError, Response, StaticResponse, Header, HttpResult, StaticHeader};
 use http::frame::{RawFrame, FrameIR};
-use http::frame::HttpSetting;
 use http::transport::TransportStream;
 use http::connection::{SendFrame, ReceiveFrame, HttpFrame, HttpConnection};
 use http::session::{SessionState, DefaultSessionState, DefaultStream, Stream};
 use http::session::Client as ClientMarker;
 use http::client::{ClientConnection, HttpConnect, HttpConnectError, ClientStream, RequestStream};
+use http::settings::{Settings, SettingsState};
 
 /// Like `thread::spawn`, but with a `name` argument
 pub fn spawn_named<F, T, S>(name: S, f: F) -> thread::JoinHandle<T>
@@ -313,9 +313,6 @@ enum WorkItem<T> {
 struct ClientService<T> {
     /// The number of requests that have been sent, but are yet unanswered.
     outstanding_reqs: u32,
-    /// The limit to the number of requests that can be pending (unanswered,
-    /// but sent).
-    limit: u32,
     /// The connection that is used for underlying HTTP/2 communication.
     conn: ClientConnection,
     /// The handle allows the service to get the HTTP/2 frame that has been extracted from the data
@@ -391,11 +388,11 @@ impl<T> ClientService<T> {
         // ...and pass the non-blocking/buffering ends into the `HttpConnect` instead of the
         // blocking socket itself.
         let conn = ClientConnection::with_connection(HttpConnection::new(scheme),
-                                                     DefaultSessionState::<ClientMarker, _>::new());
+                                                     DefaultSessionState::<ClientMarker, _>::new(),
+                                                     SettingsState::new(in_flight_limit));
 
         let service = ClientService {
             outstanding_reqs: 0,
-            limit: in_flight_limit,
             conn: conn,
             user_data: HashMap::new(),
             work_queue: rx,
@@ -466,16 +463,9 @@ impl<T> ClientService<T> {
                 if self.initialized {
                     self.handle_frame()
                 } else {
-                    let settings_frame = try!(self.conn.expect_settings(&mut self.recv_handle,
-                                                                        &mut self.send_handle));
-
-                    for setting in &settings_frame.settings {
-                        if let &HttpSetting::MaxConcurrentStreams(max_streams) = setting {
-                            self.limit = max_streams;
-                        }
-                    }
-
+                    try!(self.conn.expect_settings(&mut self.recv_handle, &mut self.send_handle));
                     self.initialized = true;
+
                     Ok(())
                 }
             }
@@ -601,10 +591,16 @@ impl<T> ClientService<T> {
                 done_func(response,
                           val,
                           self.request_queue.len(),
-                          self.limit as usize,
+                          self.limit() as usize,
                           self.outstanding_reqs as usize);
             }
         };
+    }
+
+    /// Get the maximum number of concurrent streams
+    #[inline]
+    fn limit(&self) -> u32 {
+        self.conn.settings.max_concurrent_streams()
     }
 
     /// Internal helper method. Handles all closed streams by sending appropriate
@@ -625,7 +621,7 @@ impl<T> ClientService<T> {
     /// concurrent requests that it is allowed to issue, it sends a single
     /// new request to the server. Blocks until this request is sent.
     fn queue_next_request(&mut self) {
-        if self.outstanding_reqs < self.limit {
+        if self.outstanding_reqs < self.limit() {
             // Try to queue another request since we haven't gone over
             // the (arbitrary) limit.
             debug!("Not over the limit yet. Checking for more requests...");

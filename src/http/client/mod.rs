@@ -13,6 +13,7 @@ use http::connection::{SendFrame, ReceiveFrame, SendStatus, HttpConnection, EndS
 use http::session::{Session, Stream, DefaultStream, DefaultSessionState, SessionState};
 use http::session::Client as ClientMarker;
 use http::priority::SimplePrioritizer;
+use http::settings::{Settings, SettingsState};
 
 #[cfg(feature="tls")]
 pub mod tls;
@@ -189,8 +190,10 @@ pub struct RequestStream<'n, 'v, S>
 
 /// The struct extends the `HttpConnection` API with client-specific methods (such as
 /// `start_request`) and wires the `HttpConnection` to the client `Session` callbacks.
-pub struct ClientConnection<State = DefaultSessionState<ClientMarker, DefaultStream>>
-    where State: SessionState
+pub struct ClientConnection<Set = SettingsState,
+                            State = DefaultSessionState<ClientMarker, DefaultStream>>
+    where State: SessionState,
+          Set: Settings
 {
     /// The underlying `HttpConnection` that will be used for any HTTP/2
     /// communication.
@@ -198,19 +201,28 @@ pub struct ClientConnection<State = DefaultSessionState<ClientMarker, DefaultStr
     /// The state of the session associated to this client connection. Maintains the status of the
     /// connection streams.
     pub state: State,
+
+    // State of connection settings
+    pub settings: Set,
 }
 
-impl<State> ClientConnection<State>
-    where State: SessionState
+impl<Set, State> ClientConnection<Set, State>
+    where State: SessionState,
+          Set: Settings
 {
     /// Creates a new `ClientConnection` that will use the given `HttpConnection`
     /// for all its underlying HTTP/2 communication.
     ///
     /// The given `state` instance will handle the maintenance of the session's state.
-    pub fn with_connection(conn: HttpConnection, state: State) -> ClientConnection<State> {
+    pub fn with_connection(conn: HttpConnection,
+                           state: State,
+                           settings: Set)
+                           -> ClientConnection<Set, State>
+    {
         ClientConnection {
             conn: conn,
             state: state,
+            settings: settings,
         }
     }
 
@@ -230,7 +242,7 @@ impl<State> ClientConnection<State>
                                                                   rx: &mut Recv,
                                                                   tx: &mut Sender)
                                                                   -> HttpResult<SettingsFrame> {
-        let mut session = ClientSession::new(&mut self.state, tx);
+        let mut session = ClientSession::new(&mut self.state, tx, &mut self.settings);
         self.conn.expect_settings(rx, &mut session)
     }
 
@@ -264,7 +276,7 @@ impl<State> ClientConnection<State>
                                                                     rx: &mut Recv,
                                                                     tx: &mut Sender)
                                                                     -> HttpResult<()> {
-        let mut session = ClientSession::new(&mut self.state, tx);
+        let mut session = ClientSession::new(&mut self.state, tx, &mut self.settings);
         self.conn.handle_next_frame(rx, &mut session)
     }
 
@@ -296,31 +308,40 @@ impl<State> ClientConnection<State>
 /// a client that streams responses directly into a file on the local file system,
 /// instead of keeping it in memory (like the `DefaultStream` does), without
 /// having to change any HTTP/2-specific logic.
-pub struct ClientSession<'a, State, S>
+pub struct ClientSession<'a, State, S, Set>
     where State: SessionState + 'a,
-          S: SendFrame + 'a
+          S: SendFrame + 'a,
+          Set: Settings + 'a,
 {
     state: &'a mut State,
     sender: &'a mut S,
+    settings: &'a mut Set,
 }
 
-impl<'a, State, S> ClientSession<'a, State, S>
+impl<'a, State, S, Set> ClientSession<'a, State, S, Set>
     where State: SessionState + 'a,
-          S: SendFrame + 'a
+          S: SendFrame + 'a,
+          Set: Settings + 'a,
 {
     /// Returns a new `ClientSession` associated to the given state.
     #[inline]
-    pub fn new(state: &'a mut State, sender: &'a mut S) -> ClientSession<'a, State, S> {
+    pub fn new(state: &'a mut State,
+               sender: &'a mut S,
+               settings: &'a mut Set)
+               -> ClientSession<'a, State, S, Set>
+    {
         ClientSession {
             state: state,
             sender: sender,
+            settings: settings,
         }
     }
 }
 
-impl<'a, State, S> Session for ClientSession<'a, State, S>
+impl<'a, State, S, Set> Session for ClientSession<'a, State, S, Set>
     where State: SessionState + 'a,
-          S: SendFrame + 'a
+          S: SendFrame + 'a,
+          Set: Settings + 'a,
 {
     fn new_data_chunk(&mut self,
                       stream_id: StreamId,
@@ -390,9 +411,19 @@ impl<'a, State, S> Session for ClientSession<'a, State, S>
     }
 
     fn new_settings(&mut self,
-                    _settings: Vec<HttpSetting>,
+                    settings: Vec<HttpSetting>,
                     conn: &mut HttpConnection)
                     -> HttpResult<()> {
+
+        for setting in settings {
+            match setting {
+                HttpSetting::MaxConcurrentStreams(max_streams) => {
+                    self.settings.set_max_concurrent_streams(max_streams);
+                },
+                _ => (),
+            }
+        }
+
         debug!("Sending a SETTINGS ack");
         conn.sender(self.sender).send_settings_ack()
     }
@@ -415,10 +446,11 @@ mod tests {
     use http::{Header, ErrorCode, HttpError};
     use http::tests::common::{TestStream, build_mock_client_conn, build_mock_http_conn,
                               MockReceiveFrame, MockSendFrame};
-    use http::frame::{SettingsFrame, DataFrame, Frame, RawFrame};
+    use http::frame::{SettingsFrame, DataFrame, Frame, RawFrame, HttpSetting};
     use http::connection::{HttpFrame, SendStatus};
     use http::session::{Session, SessionState, Stream, DefaultSessionState};
     use http::session::Client as ClientMarker;
+    use http::settings::{Settings, SettingsState};
 
     /// Tests that a client connection is correctly initialized, by reading the
     /// server preface (i.e. a settings frame) as the first frame of the connection.
@@ -572,6 +604,23 @@ mod tests {
         }
     }
 
+    /// Tests that the `Settings` type is properly called when a settings frame is received.
+    #[test]
+    fn test_client_session_settings_frame() {
+        let mut state = DefaultSessionState::<ClientMarker, TestStream>::new();
+        let mut conn = build_mock_http_conn();
+        let mut sender = MockSendFrame::new();
+        let mut settings = SettingsState::default();
+
+        {
+            // Receiving setting for max concurrent streams
+            let mut session = ClientSession::new(&mut state, &mut sender, &mut settings);
+            session.new_settings(vec![HttpSetting::MaxConcurrentStreams(10)], &mut conn).unwrap();
+        }
+
+        assert_eq!(settings.max_concurrent_streams(), 10);
+    }
+
     /// Tests that a `ClientSession` notifies the correct stream when the
     /// appropriate callback is invoked.
     ///
@@ -584,17 +633,18 @@ mod tests {
         state.insert_outgoing(TestStream::new());
         let mut conn = build_mock_http_conn();
         let mut sender = MockSendFrame::new();
+        let mut settings = SettingsState::default();
 
         {
             // Registering some data to stream 1...
-            let mut session = ClientSession::new(&mut state, &mut sender);
+            let mut session = ClientSession::new(&mut state, &mut sender, &mut settings);
             session.new_data_chunk(1, &[1, 2, 3], &mut conn).unwrap();
         }
         // ...works.
         assert_eq!(state.get_stream_ref(1).unwrap().body, vec![1, 2, 3]);
         {
             // Some more...
-            let mut session = ClientSession::new(&mut state, &mut sender);
+            let mut session = ClientSession::new(&mut state, &mut sender, &mut settings);
             session.new_data_chunk(1, &[4], &mut conn).unwrap();
         }
         // ...works.
@@ -604,7 +654,7 @@ mod tests {
             Header::new(b":method", b"GET"),
         ];
         {
-            let mut session = ClientSession::new(&mut state, &mut sender);
+            let mut session = ClientSession::new(&mut state, &mut sender, &mut settings);
             session.new_headers(1, headers.clone(), &mut conn).unwrap();
         }
         assert_eq!(state.get_stream_ref(1).unwrap().headers.clone().unwrap(),
@@ -613,13 +663,13 @@ mod tests {
         state.insert_outgoing(TestStream::new());
         {
             // and send it some data
-            let mut session = ClientSession::new(&mut state, &mut sender);
+            let mut session = ClientSession::new(&mut state, &mut sender, &mut settings);
             session.new_data_chunk(3, &[100], &mut conn).unwrap();
         }
         assert_eq!(state.get_stream_ref(3).unwrap().body, vec![100]);
         {
             // Finally, the stream 1 ends...
-            let mut session = ClientSession::new(&mut state, &mut sender);
+            let mut session = ClientSession::new(&mut state, &mut sender, &mut settings);
             session.end_of_stream(1, &mut conn).unwrap();
         }
         // ...and gets closed.
@@ -643,8 +693,9 @@ mod tests {
         state.insert_outgoing(TestStream::new());
         let mut conn = build_mock_http_conn();
         let mut sender = MockSendFrame::new();
+        let mut settings = SettingsState::default();
         {
-            let mut session = ClientSession::new(&mut state, &mut sender);
+            let mut session = ClientSession::new(&mut state, &mut sender, &mut settings);
             session.rst_stream(3, ErrorCode::Cancel, &mut conn).unwrap();
         }
         assert!(state.get_stream_ref(3)
@@ -662,8 +713,9 @@ mod tests {
         let mut state = DefaultSessionState::<ClientMarker, TestStream>::new();
         let mut conn = build_mock_http_conn();
         let mut sender = MockSendFrame::new();
+        let mut settings = SettingsState::default();
         let res = {
-            let mut session = ClientSession::new(&mut state, &mut sender);
+            let mut session = ClientSession::new(&mut state, &mut sender, &mut settings);
             session.on_goaway(0, ErrorCode::ProtocolError, None, &mut conn)
         };
         if let Err(HttpError::PeerConnectionError(err)) = res {

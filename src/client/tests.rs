@@ -100,7 +100,7 @@ mod async {
 
         // Make into Vec<Response>
         results.into_iter()
-               .map(|(index, res)| res)
+               .map(|(_index, res)| res)
                .collect()
     }
 

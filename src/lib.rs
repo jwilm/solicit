@@ -5,6 +5,7 @@ extern crate log;
 extern crate hpack;
 #[cfg(feature="tls")]
 extern crate openssl;
+extern crate parking_lot;
 
 pub mod http;
 pub mod client;

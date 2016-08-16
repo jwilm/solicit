@@ -5,11 +5,15 @@
 //! asynchronously.
 use std::collections::HashMap;
 
+use std::cmp::min;
 use std::fmt;
 use std::io;
-use std::sync::mpsc::{Sender, Receiver};
-use std::sync::mpsc;
+use std::mem;
+use std::sync::Arc;
+use std::sync::mpsc::{self, Sender, Receiver};
 use std::thread;
+
+use parking_lot::Mutex;
 
 use http::{StreamId, HttpError, Response, StaticResponse, Header, HttpResult, StaticHeader};
 use http::frame::{RawFrame, FrameIR};
@@ -97,7 +101,7 @@ impl<S> ChannelFrameSender<S>
                                     .map_err(|_| {
                                         io::Error::new(io::ErrorKind::Other, "Unable to send frame")
                                     }));
-        debug!("Performing the actual send frame IO");
+        trace!("Performing the actual send frame IO");
         let raw_frame: RawFrame = frame_buffer.into();
         try!(self.inner.send_frame(raw_frame));
         Ok(())
@@ -120,7 +124,7 @@ impl SendFrame for ChannelFrameSenderHandle {
         try!(self.tx
                  .send(buf.into_inner())
                  .map_err(|_| io::Error::new(io::ErrorKind::Other, "Unable to send frame")));
-        debug!("Queued the frame for sending...");
+        trace!("Queued the frame for sending...");
         Ok(())
     }
 }
@@ -280,6 +284,16 @@ enum WorkItem<T> {
     SendPing,
 }
 
+/// The client delegate receives completed requests and other messages from a service. Each service
+/// has precisely one delegate.
+pub trait ClientDelegate<T> : Send + 'static {
+    /// Called when a response is received
+    fn response(&mut self, response: StaticResponse, user_data: T);
+
+    /// Called when the service is halted
+    fn halted(&mut self, ClientDoneState<T>);
+}
+
 /// An internal struct encapsulating a service that lets multiple clients
 /// issue concurrent requests to the same HTTP/2 connection.
 ///
@@ -313,6 +327,8 @@ enum WorkItem<T> {
 struct ClientService<T> {
     /// The number of requests that have been sent, but are yet unanswered.
     outstanding_reqs: u32,
+    /// Hard cap for max streams; overrides larger values of settings max concurrent streams.
+    limit: u32,
     /// The connection that is used for underlying HTTP/2 communication.
     conn: ClientConnection,
     /// The handle allows the service to get the HTTP/2 frame that has been extracted from the data
@@ -335,8 +351,21 @@ struct ClientService<T> {
     host: Vec<u8>,
     /// Whether the connection has already been initialized.
     initialized: bool,
-    /// Callback that's run when a request is completed
-    done_func: Box<Fn(StaticResponse, T, usize, usize, usize) + Send>,
+    /// Delegate for service events
+    delegate: Box<ClientDelegate<T>>,
+
+    /// Whether the service is stopping
+    ///
+    /// When creating the shutdown state, we drain the mpsc::channel of work items. However, there
+    /// is a race condition here if the client is still adding items, and this flag serves to
+    /// prevent that race. A mutex is used instead of an atomic bool to prevent a race of
+    ///
+    /// 1. client checks and sees flag false; thread is suspended
+    /// 2. service is shutdown (sets flag, drains channel)
+    /// 3. client thread resumes and pushes to channel.
+    ///
+    /// This is false until shutdown.
+    closing: Arc<Mutex<bool>>,
 }
 
 /// A helper wrapper around the components of the `ClientService` that are returned from its
@@ -345,7 +374,7 @@ struct Service<S, T>(ClientService<T>, Sender<WorkItem<T>>,
                      ChannelFrameReceiver<S>, ChannelFrameSender<S>)
     where S: TransportStream;
 
-impl<T> ClientService<T> {
+impl<T: 'static> ClientService<T> {
     /// Creates a new `ClientService` that will use the provided `ClientStream` for its underlying
     /// network communication. A handle is returned for both the read, as well as the write end of
     /// the socket that allows the client that creates the `ClientService` to perform the blocking
@@ -368,12 +397,10 @@ impl<T> ClientService<T> {
     ///
     /// If no HTTP/2 connection can be established to the given host on the
     /// given port, returns `None`.
-    pub fn new<S, F>(client_stream: ClientStream<S>,
+    pub fn new<S>(client_stream: ClientStream<S>,
                      in_flight_limit: u32,
-                     done_func: Box<F>) -> Service<S, T>
+                     delegate: Box<ClientDelegate<T>>) -> Service<S, T>
         where S: TransportStream,
-              // queued, limit, in-flight
-              F: Fn(StaticResponse, T, usize, usize, usize) + Send + 'static
     {
         let (tx, rx): (Sender<WorkItem<T>>, Receiver<WorkItem<T>>) = mpsc::channel();
         let ClientStream(stream, scheme, host) = client_stream;
@@ -389,10 +416,11 @@ impl<T> ClientService<T> {
         // blocking socket itself.
         let conn = ClientConnection::with_connection(HttpConnection::new(scheme),
                                                      DefaultSessionState::<ClientMarker, _>::new(),
-                                                     SettingsState::new(in_flight_limit));
+                                                     SettingsState::default());
 
         let service = ClientService {
             outstanding_reqs: 0,
+            limit: in_flight_limit,
             conn: conn,
             user_data: HashMap::new(),
             work_queue: rx,
@@ -402,7 +430,8 @@ impl<T> ClientService<T> {
             client_count: 0,
             host: host.as_bytes().to_vec(),
             initialized: false,
-            done_func: done_func,
+            delegate: delegate,
+            closing: Arc::new(Mutex::new(false)),
         };
 
         // Returns the handles to the channel sender/receiver, so that the client can use them to
@@ -454,7 +483,7 @@ impl<T> ClientService<T> {
         // Dispatch the work to the corresponding method...
         match work_item {
             WorkItem::Request(async_req) => {
-                debug!("Queuing request");
+                trace!("Queuing request");
                 self.request_queue.push(async_req);
                 self.queue_next_request();
                 Ok(())
@@ -470,7 +499,7 @@ impl<T> ClientService<T> {
                 }
             }
             WorkItem::SendData => {
-                debug!("Will queue some request data");
+                trace!("Will queue some request data");
                 try!(self.conn.send_next_data(&mut self.send_handle));
                 Ok(())
             },
@@ -586,13 +615,7 @@ impl<T> ClientService<T> {
                     body: stream.body,
                 };
 
-                let done_func = &self.done_func;
-
-                done_func(response,
-                          val,
-                          self.request_queue.len(),
-                          self.limit() as usize,
-                          self.outstanding_reqs as usize);
+                self.delegate.response(response, val);
             }
         };
     }
@@ -600,7 +623,7 @@ impl<T> ClientService<T> {
     /// Get the maximum number of concurrent streams
     #[inline]
     fn limit(&self) -> u32 {
-        self.conn.settings.max_concurrent_streams()
+        min(self.limit, self.conn.settings.max_concurrent_streams())
     }
 
     /// Internal helper method. Handles all closed streams by sending appropriate
@@ -624,7 +647,7 @@ impl<T> ClientService<T> {
         if self.outstanding_reqs < self.limit() {
             // Try to queue another request since we haven't gone over
             // the (arbitrary) limit.
-            debug!("Not over the limit yet. Checking for more requests...");
+            trace!("Not over the limit yet. Checking for more requests...");
             if !self.request_queue.is_empty() {
                 let async_req = self.request_queue.remove(0);
                 self.send_request(async_req);
@@ -636,6 +659,59 @@ impl<T> ClientService<T> {
     fn send_ping(&mut self) {
         self.conn.send_ping(&mut self.send_handle).ok().unwrap();
     }
+
+
+    /// When the service has exitted, this returns any user data still in the service.
+    ///
+    /// Calling this is only needed if an error was encountered.
+    fn halted(&mut self, last_stream_id: Option<StreamId>) {
+        let mut closing = self.closing.lock();
+        *closing = true;
+
+        // Take ownership of queued requests
+        let mut queued_requests = mem::replace(&mut self.request_queue, Vec::new());
+
+        // Drain the work queue. We can just ignore anything that's not a queued
+        // request at this point.
+        while let Ok(val) = self.work_queue.try_recv() {
+            if let WorkItem::Request(req) = val {
+                queued_requests.push(req);
+            }
+        }
+
+        // Discard queued requests and build list of their user data.
+        let mut unsent_user_data = Vec::new();
+        for async_req in queued_requests {
+            unsent_user_data.push(async_req.user_data);
+        }
+
+        if last_stream_id.is_none() {
+            self.delegate.halted(ClientDoneState::Bad { queued: unsent_user_data });
+            return;
+        }
+
+        let last_stream_id = last_stream_id.unwrap();
+
+        // If a stream id was provided, pull user data out of active streams and categorize based on
+        // stream id. Ids with a value greater than `last_stream_id` are considered unprocessed
+        // while all others may have had some action taken by the server.
+        let (mut processed, mut unprocessed) = (Vec::new(), Vec::new());
+        let user_data_hash = mem::replace(&mut self.user_data, HashMap::new());
+
+        for (stream_id, user_data) in user_data_hash {
+            if stream_id > last_stream_id {
+                unprocessed.push(user_data);
+            } else {
+                processed.push(user_data);
+            }
+        }
+
+        self.delegate.halted(ClientDoneState::Dirty {
+            queued: unsent_user_data,
+            maybe_processed: processed,
+            unprocessed: unprocessed,
+        });
+    }
 }
 
 /// A struct representing an HTTP/2 client that receives responses to its
@@ -646,20 +722,32 @@ impl<T> ClientService<T> {
 /// # Example
 ///
 /// ```no_run
-/// use solicit::client::Client;
+/// use solicit::client::{Client, ClientDelegate, ClientDoneState};
 /// use solicit::http::client::CleartextConnector;
+/// use solicit::http::StaticResponse;
 /// use std::thread;
 /// use std::str;
 /// use std::sync::mpsc;
+///
+/// struct Delegate(mpsc::Sender<StaticResponse>);
+///
+/// impl ClientDelegate<()> for Delegate {
+///     fn response(&mut self, resp: StaticResponse, _user_data: ()) {
+///         println!("req done");
+///         self.0.send(resp).unwrap();
+///     }
+///
+///     fn halted(&mut self, _: ClientDoneState<()>) {
+///         // pass
+///     }
+/// }
 ///
 /// let (tx, rx) = mpsc::channel();
 ///
 /// // Connect to a server that supports HTTP/2
 /// let connector = CleartextConnector::new("http2bin.org");
-/// let client = Client::with_connector(connector, 3, move |res, _, _, _, _| {
-///     println!("req done");
-///     let _ = tx.send(res);
-/// }).unwrap();
+/// let delegate = Delegate(tx);
+/// let client = Client::with_connector(connector, 3, delegate).unwrap();
 ///
 /// // Issue 5 requests from 5 different threads concurrently and wait for all
 /// // threads to receive their response.
@@ -688,12 +776,18 @@ pub struct Client<T> {
     /// The sender side of a channel on which a running `ClientService` expects
     /// to receive new requests, which are to be sent to the server.
     sender: Sender<WorkItem<T>>,
+
+    /// Flag indicating whether the service will accept additional requests
+    closing: Arc<Mutex<bool>>,
 }
 
 impl<T> Clone for Client<T> {
     fn clone(&self) -> Client<T> {
         self.sender.send(WorkItem::NewClient).unwrap();
-        Client { sender: self.sender.clone() }
+        Client {
+            sender: self.sender.clone(),
+            closing: self.closing.clone(),
+        }
     }
 }
 
@@ -722,14 +816,16 @@ impl<T> Client<T> {
     /// the thread to exit.
     ///
     /// If the HTTP/2 connection cannot be initialized returns `None`.
-    pub fn with_connector<C, S, E, F>(connector: C,
+    #[allow(unused_assignments)] // for error option in service thread
+    pub fn with_connector<C, S, E, D>(connector: C,
                                       in_flight_limit: u32,
-                                      done_func: F) -> Result<Client<T>, ClientConnectError<E>>
+                                      delegate: D)
+                                      -> Result<Client<T>, ClientConnectError<E>>
         where C: HttpConnect<Stream = S, Err = E>,
               S: TransportStream + Send + 'static,
               E: HttpConnectError + 'static,
-              F: Fn(StaticResponse, T, usize, usize, usize) + Send + 'static,
-              T: Send + 'static
+              D: ClientDelegate<T>,
+              T: Send + 'static,
     {
         // Use the provided connector to establish a network connection...
         let client_stream = try!(connector.connect());
@@ -741,11 +837,13 @@ impl<T> Client<T> {
         // decides to close it), effectively leaking the socket and thread.
         let mut sck = try!(client_stream.0.try_split());
 
-        let service = ClientService::new(client_stream, in_flight_limit, Box::new(done_func));
+        let service = ClientService::new(client_stream, in_flight_limit, Box::new(delegate));
 
         let Service(mut service, rx, mut recv_frame, mut send_frame) = service;
 
         service.on_new_client();
+
+        let closing = service.closing.clone();
 
         // Keep a handle to the work queue to notify the service of newly read frames, making it so
         // that it never blocks on waiting for frames to read.
@@ -753,21 +851,41 @@ impl<T> Client<T> {
         let sender_work_queue = rx.clone();
 
         spawn_named("Solicit Service", move || {
+            let mut error = None;
             loop {
                 match service.run_once() {
                     Ok(_) => (),
                     Err(err) => {
                         error!("Solicit Service received error\n{:?}", err);
+                        error = Some(err);
                         break;
                     }
                 }
             }
 
             debug!("Service thread halting");
-            // This is the one place where it's okay to unwrap, as if the shutdown fails, there's
-            // really nothing we can do to recover at this point...
+
             // This forces the reader thread to stop, as the socket is no longer operational.
-            sck.close().expect("close socket handler");
+            let _ = sck.close().map_err(|err| debug!("failed to close socket; {}", err));
+
+            let error = error.expect("can't exit service loop unless error occurs");
+            match error {
+                ClientServiceErr::Done => (),
+                ClientServiceErr::Http(herr) => {
+                    match herr {
+                        HttpError::PeerConnectionError(err) => {
+                            let last_stream_id = match err.last_stream_id() {
+                                0 => None,
+                                val @ _ => Some(val)
+                            };
+                            service.halted(last_stream_id);
+                        },
+                        _ => {
+                            service.halted(None);
+                        }
+                    }
+                }
+            }
         });
 
         spawn_named("Solicit Sender", move || {
@@ -784,7 +902,10 @@ impl<T> Client<T> {
             debug!("Reader thread halting");
         });
 
-        Ok(Client { sender: rx })
+        Ok(Client {
+            sender: rx,
+            closing: closing,
+        })
     }
 
     /// Issues a new request to the server.
@@ -814,19 +935,28 @@ impl<T> Client<T> {
             headers: &[StaticHeader],
             body: Option<Vec<u8>>,
             user_data: T)
-            -> Result<(), T> {
-
-        // A send can only fail if the receiver is disconnected. If the send
-        // fails here, it means that the service hit an error on the underlying
-        // HTTP/2 connection and will never come alive again.
-        let res = self.sender.send(WorkItem::Request(AsyncRequest {
+            -> Result<(), T>
+    {
+        let req = AsyncRequest {
             method: method.to_vec(),
             path: path.to_vec(),
             headers: headers.to_vec(),
             body: body,
             user_data: user_data,
-        }));
+        };
 
+        let res = {
+            let closing = self.closing.lock();
+            if *closing {
+                return Err(req.user_data);
+            }
+
+            self.sender.send(WorkItem::Request(req))
+        };
+
+        // A send can only fail if the receiver is disconnected. If the send
+        // fails here, it means that the service hit an error on the underlying
+        // HTTP/2 connection and will never come alive again.
         match res {
             Ok(_) => Ok(()),
             Err(mpsc::SendError(work)) => {
@@ -859,6 +989,50 @@ impl<T> Client<T> {
     /// Sends a PING to the server
     pub fn ping(&self) -> Result<(), &'static str> {
         self.sender.send(WorkItem::SendPing).map_err(|_| "Client not available")
+    }
+}
+
+/// State client was in upon disconnecting and stopping
+///
+/// This provides a means for retrieving user data for queued requests and streams in the case of
+/// non-clean shutdown.
+pub enum ClientDoneState<T> {
+    /// Client shut down normally with no dangling streams or queued requests
+    Clean,
+
+    /// Client shut down abnormally; it is not known what streams (if any) were left unprocessed.
+    Bad {
+        queued: Vec<T>,
+    },
+
+    /// Client was told to go away
+    ///
+    /// User data for streams that were maybe processed are included in addition to certainly
+    /// unprocessed requests' user data. User data for queued requests is also included.
+    Dirty {
+        queued: Vec<T>,
+        maybe_processed: Vec<T>,
+        unprocessed: Vec<T>,
+    }
+}
+
+impl<T> fmt::Debug for ClientDoneState<T> where T: fmt::Debug {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            &ClientDoneState::Clean => write!(f, "ClientDoneState::Clean"),
+            &ClientDoneState::Bad { ref queued } => {
+                f.debug_struct("ClientDoneState::Bad")
+                 .field("queued", queued)
+                 .finish()
+            },
+            &ClientDoneState::Dirty { ref queued, ref maybe_processed, ref unprocessed } => {
+                f.debug_struct("ClientDoneState::Dirty")
+                 .field("queued", queued)
+                 .field("maybe_processed", maybe_processed)
+                 .field("unprocessed", unprocessed)
+                 .finish()
+            }
+        }
     }
 }
 

@@ -326,6 +326,7 @@ impl fmt::Display for DebugData {
 #[derive(Debug, PartialEq, Clone)]
 pub struct ConnectionError {
     error_code: ErrorCode,
+    last_stream_id: StreamId,
     debug_data: Option<DebugData>,
 }
 
@@ -334,6 +335,7 @@ impl ConnectionError {
     pub fn new(error_code: ErrorCode) -> ConnectionError {
         ConnectionError {
             error_code: error_code,
+            last_stream_id: 0,
             debug_data: None,
         }
     }
@@ -350,6 +352,7 @@ impl ConnectionError {
         ConnectionError {
             error_code: error_code,
             debug_data: debug_data,
+            last_stream_id: 0,
         }
     }
 
@@ -373,6 +376,20 @@ impl ConnectionError {
             Some(DebugData::Raw(_)) | None => None,
             Some(DebugData::Utf8(ref s)) => Some(s.as_str())
         }
+    }
+
+    pub fn last_stream_id(&self) -> StreamId {
+        self.last_stream_id
+    }
+}
+
+impl From<(StreamId, ErrorCode, Option<Vec<u8>>)> for ConnectionError {
+    fn from(val: (StreamId, ErrorCode, Option<Vec<u8>>)) -> ConnectionError {
+        let (stream, code, data) = val;
+        let mut err = ConnectionError::with_debug_data(code, data);
+        err.last_stream_id = stream;
+
+        err
     }
 }
 

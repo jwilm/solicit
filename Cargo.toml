@@ -15,6 +15,7 @@ documentation = "https://mlalic.github.io/solicit/solicit/index.html"
 [dependencies]
 hpack = "0.3"
 log = "^0.3"
+parking_lot = "0.2"
 
 [dependencies.openssl]
 # >= 0.7.9 is required for SslStream to be Send

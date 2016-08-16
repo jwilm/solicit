@@ -68,15 +68,14 @@ pub trait Session {
     /// Concrete `Session` implementations can override this in order to, for example, figure out
     /// which streams can be safely retried (based on the last processed stream id).
     fn on_goaway(&mut self,
-                 _last_stream_id: StreamId,
+                 last_stream_id: StreamId,
                  error_code: ErrorCode,
                  debug_data: Option<&[u8]>,
                  _conn: &mut HttpConnection)
                  -> HttpResult<()>
     {
-        let err = ConnectionError::with_debug_data(error_code,
-                                                   debug_data.map(|data| data.to_vec()));
-
+        let debug_data = debug_data.map(|v| v.to_vec());
+        let err = ConnectionError::from((last_stream_id, error_code, debug_data));
         Err(HttpError::PeerConnectionError(err))
    }
 }
